@@ -1,0 +1,489 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { Card } from '@/components/ui/card';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { useToast } from '@/hooks/use-toast';
+import { supabase } from '@/integrations/supabase/client';
+import { useAuth } from '@/contexts/AuthContext';
+import { Send, Bot, User, Loader2, Paperclip, X, FileText } from 'lucide-react';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+
+interface Message {
+  id: string;
+  role: string;
+  content: string;
+  created_at: string;
+}
+
+interface UploadedFile {
+  name: string;
+  size: number;
+  type: string;
+  url?: string;
+}
+
+const SimpleChat: React.FC = () => {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<UploadedFile[]>([]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [conversationId, setConversationId] = useState<string>('');
+  const [projectId, setProjectId] = useState<string>('');
+
+  // Create or get default project and conversation
+  useEffect(() => {
+    const initializeChat = async () => {
+      if (!user) return;
+
+      try {
+        // Get or create default project
+        let { data: projects, error: projectError } = await supabase
+          .from('projects')
+          .select('*')
+          .eq('user_id', user.id)
+          .eq('name', 'Default Chat')
+          .limit(1);
+
+        if (projectError) {
+          console.error('Error fetching projects:', projectError);
+          return;
+        }
+
+        let defaultProject;
+        if (!projects || projects.length === 0) {
+          // Create default project
+          const { data: newProject, error: createError } = await supabase
+            .from('projects')
+            .insert({
+              user_id: user.id,
+              name: 'Default Chat',
+              description: 'Default chat project',
+              system_prompt: 'You are a helpful AI assistant.',
+              llm_provider: 'openai',
+              llm_model: 'gpt-4o-mini'
+            })
+            .select()
+            .single();
+
+          if (createError) {
+            console.error('Error creating project:', createError);
+            return;
+          }
+          defaultProject = newProject;
+        } else {
+          defaultProject = projects[0];
+        }
+
+        setProjectId(defaultProject.id);
+
+        // Get or create default conversation
+        let { data: conversations, error: conversationError } = await supabase
+          .from('conversations')
+          .select('*')
+          .eq('user_id', user.id)
+          .eq('project_id', defaultProject.id)
+          .eq('title', 'Default Chat')
+          .limit(1);
+
+        if (conversationError) {
+          console.error('Error fetching conversations:', conversationError);
+          return;
+        }
+
+        let defaultConversation;
+        if (!conversations || conversations.length === 0) {
+          // Create default conversation
+          const { data: newConversation, error: createError } = await supabase
+            .from('conversations')
+            .insert({
+              user_id: user.id,
+              project_id: defaultProject.id,
+              title: 'Default Chat'
+            })
+            .select()
+            .single();
+
+          if (createError) {
+            console.error('Error creating conversation:', createError);
+            return;
+          }
+          defaultConversation = newConversation;
+        } else {
+          defaultConversation = conversations[0];
+        }
+
+        setConversationId(defaultConversation.id);
+
+        // Load existing messages
+        const { data: existingMessages, error: messagesError } = await supabase
+          .from('messages')
+          .select('*')
+          .eq('conversation_id', defaultConversation.id)
+          .order('created_at', { ascending: true });
+
+        if (messagesError) {
+          console.error('Error loading messages:', messagesError);
+        } else {
+          setMessages(existingMessages || []);
+        }
+
+      } catch (error) {
+        console.error('Error initializing chat:', error);
+      }
+    };
+
+    initializeChat();
+  }, [user]);
+
+  // Scroll to bottom when messages change
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // Set up real-time subscription for new messages
+  useEffect(() => {
+    if (!conversationId || !user) return;
+
+    const channel = supabase
+      .channel('messages')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const newMessage = payload.new as Message;
+          setMessages(prev => {
+            if (prev.some(msg => msg.id === newMessage.id)) {
+              return prev;
+            }
+            return [...prev, newMessage];
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [conversationId, user]);
+
+  const handleFileSelect = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || !projectId) return;
+
+    for (const file of Array.from(files)) {
+      try {
+        // Upload to Supabase Storage
+        const fileName = `${Date.now()}-${file.name}`;
+        const { error: uploadError } = await supabase.storage
+          .from('project-files')
+          .upload(`${user?.id}/${projectId}/${fileName}`, file);
+
+        if (uploadError) {
+          throw uploadError;
+        }
+
+        // Get public URL
+        const { data: { publicUrl } } = supabase.storage
+          .from('project-files')
+          .getPublicUrl(`${user?.id}/${projectId}/${fileName}`);
+
+        // Save file metadata to database
+        const { data: fileRecord, error: dbError } = await supabase
+          .from('file_uploads')
+          .insert({
+            project_id: projectId,
+            user_id: user?.id,
+            filename: file.name,
+            file_path: `${user?.id}/${projectId}/${fileName}`,
+            file_size: file.size,
+            file_type: file.type
+          })
+          .select()
+          .single();
+
+        if (dbError) {
+          throw dbError;
+        }
+
+        // Process file content in background
+        try {
+          const { error: processError } = await supabase.functions.invoke('process-file', {
+            body: {
+              fileId: fileRecord?.id,
+              filePath: `${user?.id}/${projectId}/${fileName}`,
+              fileType: file.type,
+              fileName: file.name
+            }
+          });
+          if (processError) {
+            console.warn('File content processing failed:', processError);
+          }
+        } catch (processError) {
+          console.warn('File content processing error:', processError);
+        }
+
+        setAttachedFiles(prev => [...prev, {
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          url: publicUrl
+        }]);
+
+        toast({
+          title: "File uploaded",
+          description: `${file.name} uploaded successfully`,
+        });
+
+      } catch (error) {
+        console.error('Error uploading file:', error);
+        toast({
+          title: "Upload failed",
+          description: `Failed to upload ${file.name}`,
+          variant: "destructive",
+        });
+      }
+    }
+
+    // Reset file input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const removeFile = (index: number) => {
+    setAttachedFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleSendMessage = async () => {
+    if ((!input.trim() && attachedFiles.length === 0) || !user || isLoading || !conversationId || !projectId) return;
+
+    let messageContent = input.trim();
+    
+    // Add file references to message if any
+    if (attachedFiles.length > 0) {
+      const fileList = attachedFiles.map(file => `📎 ${file.name}`).join('\n');
+      messageContent = `${messageContent}\n\nAttached files:\n${fileList}`;
+    }
+
+    setInput('');
+    setAttachedFiles([]);
+    setIsLoading(true);
+
+    try {
+      // Call the AI chat edge function
+      const { data, error } = await supabase.functions.invoke('ai-chat', {
+        body: {
+          message: messageContent,
+          conversationId,
+          projectId,
+          userId: user.id,
+        },
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to get AI response');
+      }
+
+      toast({
+        title: "Message sent",
+        description: "AI response generated successfully",
+      });
+
+    } catch (error) {
+      console.error('Error sending message:', error);
+      toast({
+        title: "Error",
+        description: "Failed to send message. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
+    }
+  };
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-120px)] max-w-4xl mx-auto">
+      <Card className="flex flex-col h-full">
+        {/* Header */}
+        <div className="p-4 border-b">
+          <h1 className="text-xl font-semibold">AI Chat</h1>
+          <p className="text-sm text-muted-foreground">Chat with AI assistant</p>
+        </div>
+
+        {/* Messages area */}
+        <ScrollArea className="flex-1 p-4">
+          <div className="space-y-4">
+            {messages.length === 0 ? (
+              <div className="text-center text-muted-foreground py-8">
+                <Bot className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                <p>Start a conversation with your AI assistant</p>
+              </div>
+            ) : (
+              messages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`flex items-start gap-3 ${
+                    message.role === 'user' ? 'flex-row-reverse' : 'flex-row'
+                  }`}
+                >
+                  <Avatar className="h-8 w-8">
+                    <AvatarFallback>
+                      {message.role === 'user' ? (
+                        <User className="h-4 w-4" />
+                      ) : (
+                        <Bot className="h-4 w-4" />
+                      )}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div
+                    className={`max-w-[80%] p-3 rounded-lg ${
+                      message.role === 'user'
+                        ? 'bg-primary text-primary-foreground ml-auto'
+                        : 'bg-muted'
+                    }`}
+                  >
+                    <p className="whitespace-pre-wrap">{message.content}</p>
+                    <span className="text-xs opacity-70 mt-1 block">
+                      {new Date(message.created_at).toLocaleTimeString()}
+                    </span>
+                  </div>
+                </div>
+              ))
+            )}
+            {isLoading && (
+              <div className="flex items-start gap-3">
+                <Avatar className="h-8 w-8">
+                  <AvatarFallback>
+                    <Bot className="h-4 w-4" />
+                  </AvatarFallback>
+                </Avatar>
+                <div className="bg-muted p-3 rounded-lg">
+                  <div className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span className="text-sm">AI is thinking...</span>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+        </ScrollArea>
+
+        {/* File attachments area */}
+        {attachedFiles.length > 0 && (
+          <div className="p-3 border-t bg-muted/30">
+            <div className="flex flex-wrap gap-2">
+              {attachedFiles.map((file, index) => (
+                <div
+                  key={index}
+                  className="flex items-center gap-2 bg-background rounded-lg p-2 border"
+                >
+                  <FileText className="h-4 w-4 text-muted-foreground" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{file.name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {formatFileSize(file.size)}
+                    </p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removeFile(index)}
+                    className="h-6 w-6 p-0"
+                  >
+                    <X className="h-3 w-3" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Input area */}
+        <div className="border-t p-4">
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={handleFileSelect}
+              disabled={isLoading}
+              className="shrink-0"
+            >
+              <Paperclip className="h-4 w-4" />
+            </Button>
+            <Textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyPress={handleKeyPress}
+              placeholder="Type your message... (Shift+Enter for new line)"
+              className="resize-none"
+              rows={2}
+              disabled={isLoading}
+            />
+            <Button
+              onClick={handleSendMessage}
+              disabled={(!input.trim() && attachedFiles.length === 0) || isLoading}
+              size="icon"
+              className="shrink-0 self-end"
+            >
+              {isLoading ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        onChange={handleFileChange}
+        className="hidden"
+        accept="*/*"
+      />
+    </div>
+  );
+};
+
+export default SimpleChat;
